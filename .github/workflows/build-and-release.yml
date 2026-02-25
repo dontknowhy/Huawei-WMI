@@ -1,0 +1,103 @@
+name: Build and release DKMS package
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Determine version from huawei-wmi.c
+        id: version
+        run: |
+          set -euo pipefail
+          if git log -n1 --pretty=format:%h -- huawei-wmi.c >/tmp/ver 2>/dev/null; then
+            VERSION=$(cat /tmp/ver)
+          else
+            VERSION=$(git rev-parse --short HEAD)
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Prepare DKMS package from template
+        run: |
+          set -euo pipefail
+          TEMPLATE=dkms/huawei-wmi-3.4
+          OUTDIR=build/huawei-wmi-${VERSION}
+          rm -rf build
+          mkdir -p $OUTDIR
+          cp -a $TEMPLATE/* $OUTDIR/
+          cp huawei-wmi.c $OUTDIR/
+          if [ ! -f "$OUTDIR/dkms.conf" ]; then
+            echo "ERROR: $OUTDIR/dkms.conf not found" >&2
+            exit 1
+          fi
+          # Replace PACKAGE_VERSION (keep quoting style)
+          if grep -q '^PACKAGE_VERSION=' "$OUTDIR/dkms.conf"; then
+            sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${VERSION}\"/" $OUTDIR/dkms.conf
+          else
+            echo "PACKAGE_VERSION=\"${VERSION}\"" >> $OUTDIR/dkms.conf
+          fi
+          tar -czf huawei-wmi-${VERSION}.tar.gz -C build huawei-wmi-${VERSION}
+          ls -lh huawei-wmi-${VERSION}.tar.gz
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Create and push git tag for this build
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          TAG=${VERSION}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse --verify --quiet "$TAG" >/dev/null; then
+            echo "Tag $TAG already exists locally. Skipping creation."
+          else
+            git tag -a "$TAG" -m "build $TAG"
+          fi
+          # Push tag to remote using token
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" --tags --no-verify
+
+      - name: Create or update release and upload package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ env.VERSION }}
+        run: |
+          set -e
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          TAG="actions-release"
+
+          # Get release by tag
+          RELEASE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API/releases/tags/$TAG" || true)
+          if echo "$RELEASE" | jq -e '.id' >/dev/null 2>&1; then
+            RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
+          else
+            DATA=$(jq -n --arg tag "$TAG" --arg name "$TAG" '{tag_name:$tag, name:$name, draft:false, prerelease:false}')
+            CREATE=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" -d "$DATA" "$API/releases")
+            RELEASE_ID=$(echo "$CREATE" | jq -r '.id')
+          fi
+
+          # Delete existing assets so only latest remains
+          ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API/releases/$RELEASE_ID/assets")
+          for id in $(echo "$ASSETS" | jq -r '.[].id'); do
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" "$API/releases/assets/$id"
+          done
+
+          # Upload new asset
+          UPLOAD_URL=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API/releases/$RELEASE_ID" | jq -r '.upload_url' | sed -e "s/{?name,label}//")
+          FNAME=huawei-wmi-${VERSION}.tar.gz
+          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/gzip" --data-binary @"$FNAME" "$UPLOAD_URL?name=$FNAME" | jq -r '.browser_download_url'
