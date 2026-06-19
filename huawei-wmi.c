@@ -21,9 +21,16 @@
 #include <linux/hwmon.h>
 #include <linux/version.h>
 #include <acpi/battery.h>
-#include <linux/version.h>
 
 #define HWMI_BUFF_SIZE 0x100
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#define sysfs_emit(buf, fmt, ...) sprintf(buf, fmt, ##__VA_ARGS__)
+#endif
+
+#ifndef kzalloc_obj
+#define kzalloc_obj(P) kzalloc(sizeof(P), GFP_KERNEL)
+#endif
 
 /*
  * Huawei WMI GUIDs
@@ -125,6 +132,7 @@ enum {
 };
 
 static const struct key_entry huawei_wmi_keymap[] = {
+	{ KE_KEY,     0x109,              { KEY_BATTERY } },
 	{ KE_KEY,     0x281,              { KEY_BRIGHTNESSDOWN } },
 	{ KE_KEY,     0x282,              { KEY_BRIGHTNESSUP } },
 	{ KE_KEY,     0x283,              { KEY_TOUCHPAD_ON } },
@@ -164,6 +172,8 @@ static const struct key_entry huawei_wmi_keymap[] = {
 	// Camera module slot
 	{ KE_KEY,     0x2e0,              { KEY_CAMERA_ACCESS_ENABLE } },
 	{ KE_KEY,     0x2e1,              { KEY_CAMERA_ACCESS_DISABLE } },
+	{ KE_KEY,     0x2e2,              { KEY_PROG2 } },
+	{ KE_KEY,     0x2e3,              { KEY_PROG3 } },
 	{ KE_END, 0 }
 };
 
@@ -281,7 +291,7 @@ static const struct dmi_system_id huawei_quirks[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "HUAWEI"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "NBLK-WAX9X")
 		},
-		.driver_data = &quirk_unknown
+		.driver_data = &quirk_skip_kbdlight
 	},
 	{
 		.callback = dmi_matched,
@@ -507,7 +517,7 @@ static int huawei_wmi_battery_get(int *start, int *end)
 		return err;
 
 	/* Find the last two non-zero values. Return status is ignored. */
-	i = 0xff;
+	i = ARRAY_SIZE(ret) - 1;
 	do {
 		if (start)
 			*start = ret[i-1];
@@ -558,7 +568,7 @@ static ssize_t charge_control_start_threshold_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", start);
+	return sysfs_emit(buf, "%d\n", start);
 }
 
 static ssize_t charge_control_end_threshold_show(struct device *dev,
@@ -571,7 +581,7 @@ static ssize_t charge_control_end_threshold_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", end);
+	return sysfs_emit(buf, "%d\n", end);
 }
 
 static ssize_t charge_control_thresholds_show(struct device *dev,
@@ -584,7 +594,7 @@ static ssize_t charge_control_thresholds_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d %d\n", start, end);
+	return sysfs_emit(buf, "%d %d\n", start, end);
 }
 
 static ssize_t charge_control_start_threshold_store(struct device *dev,
@@ -653,10 +663,17 @@ static int huawei_wmi_battery_add(struct power_supply *battery, struct acpi_batt
 static int huawei_wmi_battery_add(struct power_supply *battery)
 #endif
 {
-	device_create_file(&battery->dev, &dev_attr_charge_control_start_threshold);
-	device_create_file(&battery->dev, &dev_attr_charge_control_end_threshold);
+	int err = 0;
 
-	return 0;
+	err = device_create_file(&battery->dev, &dev_attr_charge_control_start_threshold);
+	if (err)
+		return err;
+
+	err = device_create_file(&battery->dev, &dev_attr_charge_control_end_threshold);
+	if (err)
+		device_remove_file(&battery->dev, &dev_attr_charge_control_start_threshold);
+
+	return err;
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
@@ -743,7 +760,7 @@ static ssize_t smart_charge_param_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", value);
+	return sysfs_emit(buf, "%d\n", value);
 }
 
 static ssize_t smart_charge_param_store(struct device *dev,
@@ -814,7 +831,8 @@ static int huawei_wmi_smart_charge_set(int mode, int unknow, int start, int end)
 	union hwmi_arg arg;
 	int err;
 
-	if (start < 0 || end < 0 || start > 100 || end > 100)
+	if (start < 0 || end < 0 || start > 100 || end > 100 ||
+			mode < 0 || mode > 0xff || unknow < 0 || unknow > 0xff)
 		return -EINVAL;
 
 	arg.cmd = BATTERY_CHARGE_MODE_SET;
@@ -837,7 +855,7 @@ static ssize_t smart_charge_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d %d %d %d\n", mode, unknow, start, end);
+	return sysfs_emit(buf, "%d %d %d %d\n", mode, unknow, start, end);
 }
 
 static ssize_t smart_charge_store(struct device *dev,
@@ -921,7 +939,7 @@ static ssize_t fn_lock_state_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", on);
+	return sysfs_emit(buf, "%d\n", on);
 }
 
 static ssize_t fn_lock_state_store(struct device *dev,
@@ -1015,7 +1033,6 @@ static int huawei_wmi_kbdlight_set_auto(int level)
 {
 	union hwmi_arg arg;
 	int err;
-	u8 ret[HWMI_BUFF_SIZE] = { 0 };
 
 	if (level < 0 || level > 255)
 		return -EINVAL;
@@ -1023,8 +1040,10 @@ static int huawei_wmi_kbdlight_set_auto(int level)
 	arg.cmd = KBDLIGHT_MODE_SET;
 	arg.args[2] = KBDLIGHT_MODE_AUTO;
 	err = huawei_wmi_cmd(arg.cmd, NULL, 0);
-	if (!err)
-		msleep(10);
+	if (err)
+		return err;
+
+	msleep(10);
 
 	arg.cmd = KBDLIGHT_SET_AUTO;
 	arg.args[2] = level;
@@ -1042,7 +1061,7 @@ static ssize_t kbdlight_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", level);
+	return sysfs_emit(buf, "%d\n", level);
 }
 
 static ssize_t kbdlight_store(struct device *dev,
@@ -1127,7 +1146,7 @@ static ssize_t kbdlight_timeout_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", seconds);
+	return sysfs_emit(buf, "%d\n", seconds);
 }
 
 static ssize_t kbdlight_timeout_store(struct device *dev,
@@ -1207,7 +1226,7 @@ static ssize_t power_unlock_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", on);
+	return sysfs_emit(buf, "%d\n", on);
 }
 
 static ssize_t power_unlock_store(struct device *dev,
@@ -1282,7 +1301,7 @@ static ssize_t fan1_input_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", rpm);
+	return sysfs_emit(buf, "%d\n", rpm);
 }
 
 static ssize_t fan2_input_show(struct device *dev,
@@ -1295,7 +1314,7 @@ static ssize_t fan2_input_show(struct device *dev,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", rpm);
+	return sysfs_emit(buf, "%d\n", rpm);
 }
 
 static DEVICE_ATTR_RO(fan1_input);
@@ -1372,7 +1391,7 @@ static int huawei_wmi_temp_get(u8 num, int *temp)
 		if (err)                                                \
 			return err;                                         \
 	                                                            \
-		return sprintf(buf, "%d000\n", temp);                   \
+		return sysfs_emit(buf, "%d000\n", temp);                \
 	}                                                           \
 	                                                            \
 	static DEVICE_ATTR_RO(temp##_idxA##_input);                 \
@@ -1381,7 +1400,7 @@ static int huawei_wmi_temp_get(u8 num, int *temp)
 			struct device_attribute *attr,                      \
 			char *buf)                                          \
 	{                                                           \
-		return sprintf(buf, _idxC);                             \
+		return sysfs_emit(buf, _idxC);                          \
 	}                                                           \
 	                                                            \
 	static DEVICE_ATTR_RO(temp##_idxA##_label);                 \
@@ -1606,6 +1625,9 @@ static int huawei_wmi_input_setup(struct device *dev,
 		const char *guid,
 		struct input_dev **idev)
 {
+	acpi_status status;
+	int err;
+
 	*idev = devm_input_allocate_device(dev);
 	if (!*idev)
 		return -ENOMEM;
@@ -1615,10 +1637,20 @@ static int huawei_wmi_input_setup(struct device *dev,
 	(*idev)->id.bustype = BUS_HOST;
 	(*idev)->dev.parent = dev;
 
-	return sparse_keymap_setup(*idev, huawei_wmi_keymap, NULL) ||
-		input_register_device(*idev) ||
-		wmi_install_notify_handler(guid, huawei_wmi_input_notify,
-				*idev);
+	err = sparse_keymap_setup(*idev, huawei_wmi_keymap, NULL);
+	if (err)
+		return err;
+
+	err = input_register_device(*idev);
+	if (err)
+		return err;
+
+	status = wmi_install_notify_handler(guid, huawei_wmi_input_notify,
+			*idev);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	return 0;
 }
 
 static void huawei_wmi_input_exit(struct device *dev, const char *guid)
@@ -1726,7 +1758,7 @@ static __init int huawei_wmi_init(void)
 	struct platform_device *pdev;
 	int err;
 
-	huawei_wmi = kzalloc(sizeof(struct huawei_wmi), GFP_KERNEL);
+	huawei_wmi = kzalloc_obj(struct huawei_wmi);
 	if (!huawei_wmi)
 		return -ENOMEM;
 
@@ -1747,7 +1779,7 @@ static __init int huawei_wmi_init(void)
 	if (err)
 		goto pdrv_err;
 
-	pdev = platform_device_register_simple("huawei-wmi", -1, NULL, 0);
+	pdev = platform_device_register_simple("huawei-wmi", PLATFORM_DEVID_NONE, NULL, 0);
 	if (IS_ERR(pdev)) {
 		err = PTR_ERR(pdev);
 		goto pdev_err;
